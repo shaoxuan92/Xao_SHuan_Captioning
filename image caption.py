@@ -5,5 +5,10 @@ variety enhancement: learning method with two terms: one for correctness and one
 attention model: refer to paperweekly
 '''
 import numpy as np
+def load_data():
+
 #train
-def train():
+def train(
+        dataset = 'flickr8k'
+            ):
+    load_dataset(dataset)
