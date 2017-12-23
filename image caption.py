@@ -13,4 +13,21 @@ def load_dataset(name):
 train
 '''
 def train(dataset = 'flickr8k'):
+    ##########################
+
+    ### DATA PREPROCESSING ###
+
+    ##########################
     load_data,prepare_data=load_dataset(dataset)#we can see load_data,prepare_data as a function to call flick8k.py
+    train,valid,test,worddict=load_data()
+    #process word_dic
+    word_dict = {}
+    for i,j in worddict.iteritems():
+        word_dict[j]=i
+    word_dict[0]='<EOS>'
+    word_dict[1]='UNK'
+    ##########################
+
+    ### build the theano graph ###
+
+    ##########################
