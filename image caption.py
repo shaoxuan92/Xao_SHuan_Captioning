@@ -6,4 +6,4 @@ attention model: refer to paperweekly
 '''
 import numpy as np
 #train
-def
+def train()
