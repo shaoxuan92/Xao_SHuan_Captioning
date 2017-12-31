@@ -9,6 +9,7 @@ import numpy as np
 from collections import OrderedDict
 import theano
 import theano.tensor as tensor
+from Homogenous_data import HomogeneousData
 from theano.sandbox_rng_mrg import MRG_RandomStreams as RandomStreams
 dataset = {'flickr8k':(flickr8k.load_data,flickr8k.prepare_data) }
 def load_dataset(name):
@@ -365,8 +366,69 @@ def build_model(tparams,options,sampling=True):
 
 ##############################
 def build_sampler(tparams,options,use_noise,trng,ssampling=True):
+    '''
 
+    :param tparams:
+    :param options:
+    :param use_noise:
+    :param trng:
+    :param ssampling:
+    :return:
+     f_init: theano function
+        Input: annotation, Output:initial state and memory
+        (also performs transformation on ctx0 if using lstm encoder
+     f_next: theano function
+        Takes the previous word/state/memory + ctx0 and run next
+        step through the lstm(beam search)
 
+    '''
+    #context :
+    ctx = tensor.matrix('ctx_sampler',dtype = 'float32')
+    #initial state/cell
+    ctx_mean = ctx.mean(0)
+    for lidx in xrange(1,options['n_layers_init']):
+        ctx_mean = get_layer('ff')[1](tparams,ctx_mean,options,
+                                      prefix='ff_init_%d'%lidx,activ='rectifier')
+
+    init_state = [get_layer('ff')[1](tparams,ctx_mean,options,prefix='ff_state',activ='tanh')]
+    init_memory = [get_layer('ff')[1](tparams,ctx_mean,options,prefix='ff_memory',actic='tanh')]
+
+    # print build f_init
+    f_init = theano.function([ctx],[ctx]+init_state+init_memory,name='f_init',profile=False)
+    ctx = tensor.matrix('ctx_sampler', dtype='float32')
+    x = tensor.vector('x_sampler', dtype='int64')
+    init_state = [tensor.matrix('init_state', dtype='float32')]
+    init_memory = [tensor.matrix('init_memory', dtype='float32')]
+
+    # for the first word , emb should be all zero
+    #Tensor.switch(Bool,Ture Operation,False Operation)
+    emb =tensor.switch(x[:,None] < 0, tensor.alloc(0.,1,tparams['Wemb'].shape[1]),tparams['Wemb'][x])
+    proj = get_layer('lstm_cond')[1](tparams,emb,options,
+                                     prefix='decoder',
+                                     mask=None,context=ctx,
+                                     one_step=True,
+                                     init_state=init_state[0],
+                                     init_memory=init_memory[0],
+                                     trng=trng,
+                                     use_noise=use_noise,
+                                     sampling=sampling)
+    next_state,next_memory,ctxs=[proj[0]],[proj[1]],[proj[4]]
+    proj_h = proj[0]
+
+    if options['use_dropout']:
+        pass
+    else:
+        proj_h = proj[0]
+
+    logit = get_layer('ff')[1](tparams, proj_h, options, prefix='ff_logit_lstm', activ='linear')
+    logit = tanh(logit)
+    logit = get_layer('ff')[1](tparams, logit, options, prefix='ff_logit', activ='linear')
+    logit_shp = logit.shape
+    next_probs = tensor.nnet.softmax(logit)
+    next_sample = trng.multinomial(pval=next_probs).argmax(1)
+    # next word probability
+    f_next = theano.function([x,ctx]+init_state+init_memory,[next_probs,next_sample]+next_memory+next_state,name='f_next',profile=False)
+    return f_init,f_next
 '''
 train
 '''
@@ -378,6 +440,7 @@ def train(dataset = 'flickr8k',
           dim = 1000,
 ##dim_word和n_words是word_embedding用的： 一个是每个单词的维度：dim_word,一个是总的数量n_words，也就是把单词映射成字典数量大小。相当于计算每个单词离这个单词的距离。
           dim_word=100, n_words=1000
+          maxlen=100
         ):
     ##########################
 
@@ -410,3 +473,42 @@ def train(dataset = 'flickr8k',
 
     print 'build sampler'
     f_init,f_next = build_sampler(tparams,models_option,use_noise,trng)
+
+    # compute loss  without regularizer
+    f_log_probs = theano.function(inps, -cost, profile=False,
+                                            updates=opt_outs['attn_updates']
+                                            if model_options['attn_type']=='stochastic'
+                                            else None)
+    cost = cost.mean()
+
+    hard_attn_updates = []
+    #back prop!
+    if models_option['attn_type'] == 'deterministic':
+        pass
+    else:
+        # shared variables for hard attention
+        baseline_time = theano.shared(np.float32(0.), name='baseline_time')
+        opt_outs['baseline_time'] = baseline_time
+        alpha_entropy_c = theano.shared(np.float32(alpha_entropy_c), name='alpha_entropy_c')
+        alpha_entropy_reg = alpha_entropy_c * (alphas * tensor.log(alphas)).mean()
+        # [see Section 4.1: Stochastic "Hard" Attention for derivation of this learning rule]
+        if models_option['RL_sumCost']:
+            grads = tensor.grad(cost, wrt=itemlist(tparams),
+                                disconnected_inputs='raise',
+                                known_grads={
+                                    alphas: (baseline_time - opt_outs['masked_cost'].mean(0))[None, :, None] / 10. *
+                                            (-alphas_sample / alphas) + alpha_entropy_c * (tensor.log(alphas) + 1)})
+        else:
+            pass
+
+            # [equation on bottom left of page 5]
+            hard_attn_updates += [(baseline_time, baseline_time * 0.9 + 0.1 * opt_outs['masked_cost'].mean())]
+            # updates from scan
+            hard_attn_updates += opt_outs['attn_updates']
+    lr = tensor.scalar(name='lr')
+    f_grad_shared, f_update = eval(optimizer)(lr, tparams, grads, inps, cost, hard_attn_updates)
+
+    print 'Optimization'
+
+    train_iter = HomogeneousData(train,batch_size=batch_size,maxlen=maxlen)
+
