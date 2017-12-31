@@ -5,7 +5,7 @@ structure:structured rnn + structured attentional network
 variety enhancement: learning method with two terms: one for correctness and one for variety
 attention model: refer to paperweekly
 '''
-import numpy as np
+import numpy as np 
 from collections import OrderedDict
 import theano
 import theano.tensor as tensor
