@@ -12,7 +12,7 @@ class HomogeneousData():
         self.reset()
 
     def prepare(self):
-        self.caps = self.data[0]
+        self.caps = self.data[0] 
         self.feats = self.data[1]
 
         #find the unique lengths
