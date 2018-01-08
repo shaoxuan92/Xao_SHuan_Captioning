@@ -2,7 +2,7 @@
 models incorporated with structure, variety enchancement and new attention model
 structure:structured rnn + structured attentional network
 variety enhancement: learning method with two terms: one for correctness and one for variety
-attention model: refer to paperweekly
+attention model: refer to paper-weekly
 '''
 import numpy as np
 dataset = {'flickr8k':(flickr8k.load_data,flickr8k.prepare_data) }
@@ -18,7 +18,7 @@ def train(dataset = 'flickr8k'):
     ### DATA PREPROCESSING ###
 
     ##########################
-    load_data,prepare_data=load_dataset(dataset)#we can see load_data,prepare_data as a function to call flick8k.py
+    load_data,prepare_data=load_dataset(dataset)  #we can see load_data,prepare_data as a function to call flick8k.py
     train,valid,test,worddict=load_data()
     #process word_dic
     word_dict = {}
