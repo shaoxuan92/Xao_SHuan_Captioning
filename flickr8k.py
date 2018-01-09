@@ -1,4 +1,5 @@
 import cPickle as pkl
+import numpy as np
 def load_data(load_train=True,load_dev=True,load_test=True,path='./'):
     ###############
 
@@ -7,7 +8,7 @@ def load_data(load_train=True,load_dev=True,load_test=True,path='./'):
     ###############
     ###############
 
-     #load train data# 
+     #load train data#
 
     ###############
     if load_train:
@@ -55,3 +56,33 @@ def load_data(load_train=True,load_dev=True,load_test=True,path='./'):
 
     ###############
     return train,dev,test,worddict
+
+
+def prepare_data(caps, features, worddict, maxlen=None, n_words=10000, zero_pad=False):
+    # x: a list of sequences
+    seqs = []
+    feat_list = []
+    for cc in caps:
+        seqs.append([worddict[w] if worddict[w] < n_words else 1 for w in cc[0].split()])
+        feat_list.append(features[cc[1]])
+
+    lengths = [len(s) for s in seqs]
+    y = np.zeros((len(feat_list),feat_list[0].shape[1])).astype('float32')
+
+    for idx,ff in enumerate(feat_list):
+        y[idx,:] = np.array(ff.todense())#todense 就是把稀疏矩阵转化为完整特征矩阵
+
+    y = y.reshape([y.shape[0],14*14,512])
+
+    n_samples = len(seqs)
+    max_len = np.max(lengths) + 1
+
+    x = np.zeros((max_len,n_samples)).astype('int64')
+    x_mask = np.zeros((max_len,n_samples)).atype('float32')
+    for idx,s in enumerate(seqs):
+        x[:lengths[idx],idx] = s
+        x_mask[:lengths[idx]+1,idx] = 1
+
+    return x,x_mask,y
+
+

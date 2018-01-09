@@ -1,20 +1,22 @@
-#_*_coding:utf-8_*_
+# -*- coding: utf-8 -*-
 '''
 models incorporated with structure, variety enchancement and new attention model
 structure:structured rnn + structured attentional network
 variety enhancement: learning method with two terms: one for correctness and one for variety
 attention model: refer to paperweekly
 '''
-import numpy as np 
+import numpy as np
+import cPickle as pkl
 from collections import OrderedDict
 import theano
 import theano.tensor as tensor
 from Homogenous_data import HomogeneousData
 from theano.sandbox_rng_mrg import MRG_RandomStreams as RandomStreams
+from sklearn.cross_validation import kFold
+import time
 dataset = {'flickr8k':(flickr8k.load_data,flickr8k.prepare_data) }
 def load_dataset(name):
     return dataset[name][0],dataset[name][1]
-
 def validate_options(options):
     # get some checks here
 
@@ -83,6 +85,51 @@ def param_init_fflayer(options,params,prefix='ff',nin=None,nout=None):
 def fflayer(tparams,state_below,options,prefix='ronv',activ='lambda x:tensor.tanh(x)',**kwargs):
 #########state_below是一个3D矩阵，[n_step,Batch_size,dim_word]
     return eval(activ)(tensor.dot(state_below,tparams[_p(prefix,'W')])+tparams[_p(prefix,'b')])
+
+def param_init_lstm(options,params,prefix='lstm',nin=None,dim=None):
+    W = np.concatenate([norm_weight(nin,dim),norm_weight(nin,dim),norm_weight(nin,dim),norm_weight(nin,dim)],axis=1)
+    params[_p(prefix,'W')] = W
+    U = np.concatenate([ortho_weight(dim),ortho_weight(dim),ortho_weight(dim),ortho_weight(dim)],axis=1)
+    params[_p(prefix,'U')] = U
+    params[_p(prefix,'b')] = np.zeros((4 * dim,)).astype('float32')
+    return params
+def lstm_layer(tparams,state_below,options,prefix='lstm',mask=None,**kwargs):
+    nsteps = state_below.shape[0]
+    dim = tparams[_p(prefix,'U')].shape[0]
+    if state_below.ndim ==3:
+        n_samples = state_below.shape[1]
+        init_state = tensor.alloc(0., n_samples, dim)
+        init_memory = tensor.alloc(0., n_samples, dim)
+    #during sampleing
+    else:
+        n_samples = 1
+        init_state = tensor.alloc(0.,dim)
+        init_memory = tensor.alloc(0.,dim)
+    if mask == None:
+        mask = tensor.alloc(1.,state_below.shape[0],1)
+
+    # use the slice to calculated the diffrent gate
+    def _slice(_x,n,dim):
+        if _x.ndim == 3:
+            return _x[:,:, n*dim:(n+1)*dim]
+        elif _x.ndim == 2:
+            return _x[:,n*dim:(n+1)*dim]
+        return _x[n*dim:(n+1)*dim]
+    def _step(m_,x_,h_,c_):
+        preact = tensor.dot(h_,tparams[_p(prefix,'U')])
+        preact += x_
+
+        i = tensor.nnet.sigmoid(_slice(preact,0,dim))
+        f = tensor.nnet.sigmoid(_slice(preact,1,dim))
+        o = tensor.nnet.sigmoid(_slice(preact,2,dim))
+        c = tensor.tanh(_slice(preact,3,dim))
+        c = f * c_ + i * c
+        h = o * tensor.tanh(c)
+        return h, c, i, f, o, preact
+    state_below = tensor.dot(state_below, tparams[_p(prefix,'W')]) + tparams[_p(prefix,'b')]
+    rval, updates = theano.scan(_step,sequence=[mask,state_below],outputs_info = [init_state,init_memory,None,None,None,None],name=_p(prefix,'_layers'),
+                                n_steps=nsteps,profile=False)
+    return rval
 #conditional LSTM layer with Attention
 def param_init_lstm_cond(options,params,pre_fix='lstm_cond',nin=None,dim=None,dimctx=None):
     if nin is None:###what is nin,dim,dimctx mean???????????????????????????????????? THINK IT AS Weight
@@ -359,7 +406,95 @@ def build_model(tparams,options,sampling=True):
 
 
 
+#generate sample
+def gen_sample(tparams, f_init, f_next, ctx0, options,
+               trng=None, k=1, maxlen=30, stochastic=False):
 
+    '''
+    generate sample with beam search
+    Generate captions with beam search.
+
+    This function uses the beam search algorithm to conditionally
+    generate candidate captions. Supports beamsearch and stochastic
+    sampling.
+    Parameters
+    ----------
+    tparams : OrderedDict()
+        dictionary of theano shared variables represented weight
+        matricies
+    f_init : theano function
+        input: annotation, output: initial lstm state and memory
+        (also performs transformation on ctx0 if using lstm_encoder)
+    f_next: theano function
+        takes the previous word/state/memory + ctx0 and runs one
+        step through the lstm
+    ctx0 : numpy array
+        annotation from convnet, of dimension #annotations x # dimension
+        [e.g (196 x 512)]
+    options : dict
+        dictionary of flags and options
+    trng : random number generator
+    k : int
+        size of beam search
+    maxlen : int
+        maximum allowed caption size
+    stochastic : bool
+        if True, sample stochastically
+    Returns
+    -------
+    sample : list of list
+        each sublist contains an (encoded) sample from the model
+    sample_score : numpy array
+        scores of each sample
+
+    '''
+    sample = []
+    sample_score = []
+    live_k = 1
+    dead_k = 0
+    rval = f_init(ctx0)
+    ctx0 = rval[0]
+    next_state = []
+    next_memory = []
+# only matters if we use lstm encoder
+    rval = f_init(ctx0)# f_init :Input: annotation, Output: initial lstm state and memory (also performs transformation on ctx0 if using lstm_encoder)
+    ctx0 = rval[0]
+    next_state = []
+    next_memory = []
+
+# the states are returned as a: (dim,) and this is just a reshape to (1, dim)
+    for lidx in xrange(options['n_layer_lstm']):
+        next_state.append(rval[1+lidx])
+        next_state[-1] = next_state[-1].reshape([1,next_state[-1].shape[0]])
+    for lidx in xrange(options['n_layers_lstm']):
+        next_memory.append(rval[1 + options['n_layers_lstm'] + lidx])
+        next_memory[-1] = next_memory[-1].reshape([1, next_memory[-1].shape[0]])
+    next_w = -1 * np.ones((1,)).astype('int64')
+    for ii in xrange(maxlen):
+        # our "next" state/memory in our previous step is now our "initial" state and memory
+        rval = f_next(*([next_w,ctx0]+next_state+next_memory))
+        next_p = rval[0]#rval[0]是一个3D矩阵，[n_Step，BatchSize，Emb_Dim][n_Step，BatchSize，Emb_Dim]。
+        next_w = rval[1]
+        # extract all the states and memories
+        next_state = []
+        next_memory = []
+        for lidx in xrange(options['n_layers_lstm']):
+            next_state.append(rval[2 + lidx])
+            next_memory.append(rval[2 + options['n_layers_lstm'] + lidx])
+    if stochastic:
+        pass
+    else:
+
+def pred_probs(f_log_probs,options,worddict,prepare_data,data,iterator,verbose=False):
+    n_samples = len(data[0])
+    probs = np.zeros((n_samples,1)).astype('float32')
+    n_done = 0
+    for _, valid_index in iterator:
+        x, mask, ctx = prepare_data([data[0][t] for t in valid_index],data[1],worddict,maxlen=None,n_words=options['n_words'])
+        pred_probs = f_log_probs(x,mask,ctx)
+        probs[valid_index] = pred_probs[:None]
+
+        n_done += len(valid_index)
 ###############################
 
 ##### Build_sampler###########
@@ -439,8 +574,15 @@ def train(dataset = 'flickr8k',
           n_layers_init = 1,
           dim = 1000,
 ##dim_word和n_words是word_embedding用的： 一个是每个单词的维度：dim_word,一个是总的数量n_words，也就是把单词映射成字典数量大小。相当于计算每个单词离这个单词的距离。
-          dim_word=100, n_words=1000
-          maxlen=100
+          dim_word=100, n_words=1000,
+          maxlen=100,
+          valid_batch_size = 16,
+          lrate=0.01,
+          dispFreq=100,
+          saveFreq=1000,
+          saveto='model.npz',  # relative path of saved model file
+          sampleFreq=100,  # generate some samples after every sampleFreq updates
+
         ):
     ##########################
 
@@ -511,4 +653,114 @@ def train(dataset = 'flickr8k',
     print 'Optimization'
 
     train_iter = HomogeneousData(train,batch_size=batch_size,maxlen=maxlen)
+
+    if valid:
+        kf_valid = Kfold(len(valid[0]),n_folds=len(valid[0])/valid_batch_size,shuffle=False)
+    if test:
+        kf_test = KFold(len(test[0]), n_folds=len(test[0])/valid_batch_size, shuffle=False)
+
+    history_errs = []
+    best_p = None
+    uidx = 0
+    estop = False
+    for eidx in xrange(max_epochs):
+        print 'Epoch: ',eidx
+        n_samples = 0
+
+        for caps in train_iter:
+            n_samples += len(caps)
+            uidx += 1
+            #  turn on dropout
+            use_noise.set_value(1.)####通过查询可以知道use_noise是个占位符shared variable
+
+            #processing the caption and record the time to help detect bottleneck
+            pd_start = time.time()
+            #prepare_data 见 flickr8k.py中的prepare
+            x,mask,ctx = prepare_data(caps,#是train_iter的东西，在homogeneousData中获得
+                                      train[1],##由flickr8k.py 中load_data
+                                      worddict,##同上，也在load_data中
+                                      maxlen=maxlen,
+                                      n_words=n_words)
+            pd_duration = time.time() - pd_start
+
+            # get the loss for the minitbatch and update the weights
+            ud_start = time.time()
+            cost = f_grad_shared(x,mask,ctx)
+            f_update(lrate)
+            ud_duration = time.time() - ud_start  # some monitoring for each mini-batch
+            ##检查有没有NAN
+            if np.isnan(cost) or np.isinf(cost):
+                print 'Nan Detected'
+                return 1.,1.,1.
+            if np.mod(uidx,dispFreq) == 0:
+                print 'Epoch', eidx, 'Update', uidx, 'Cost', cost, 'PD', pd_duration, 'UD', ud_duration
+            # Checkpoint
+            if np.mod(uidx,saveFreq) == 0:
+                print 'Saving...'
+                if best_p is not None:
+                    pass
+                else:
+                    params = unzip(tparams)
+                np.savez(saveto,history_errs=history_errs,**params)#。savez()提供了将多个数组存储至一个文件的能力
+                pkl.dump(models_option,open('%s.pkl'%saveto,'wb'))
+
+                print 'Done...'
+
+            # Print a generated sample as a sanity check
+            if np.mod(uidx,sampleFreq) == 0:
+                #首先turn out drop-out
+                use_noise.set_value(0.)
+                x_s  = x
+                mask_s = mask
+                ctx_s = ctx
+
+                for jj in xrange(np.minimum(10,len(caps))):
+                    sample,score = gen_sample(tparams,f_init,f_next,ctx_s[jj],models_option,trng=trng,k=5,maxlen=30,stochastic=False)
+                    # Decode the sample from encoding back to words
+                    print 'Truth ',jj,': '
+                    for vv in x_s[:,jj]:
+                        if vv == 0:
+                            break
+                        if vv in word_dict:
+                            print word_dict[vv]
+                        else:
+                            print 'UNK'
+                    print
+                    for kk,ss in enumerate([sample[0]]):
+                        print 'Sample (',kk,') ', jj, ': ',
+                        for vv in ss:
+                            if vv == 0:
+                                break
+                            if vv in word_dict:
+                                print worddict[vv],
+                            else:
+                                print 'UNK'
+                    print
+
+            if np.mod(udix, validFreq) == 0:
+                use_noise.set_value(0.)
+                train_err = 0
+                valid_err = 0
+                test_err = 0
+
+                if valid:
+                    valid_err = -pred_probs(f_log_probs,models_option,worddict,prepare_data,valid,kf_valid).mean()
+                if test:
+                    test_err = -preb_probs(f_log_probs,models_option,worddict,prepare_data,test,kf_test).mean()
+                history_errs.append([valid, test_err])
+
+                if udix == 0 or valid_err <= np.array(history_errs)[:,0].min():
+                    best_p = unzip(tparams)
+                    params = copy.copy(best_p)
+                    params = unzip(tparams)
+                    np.savez(saveto+'_bestll', history_errs=history_errs, **params)
+                    bad_counter = 0
+
+                if eidx > patience and len(history_errs) > patience and valid_err >= np.array(history_errs)[:-patience,0].min()
+                    bad_counter += 1
+                    if bad_counter > patience:
+                        print 'Early Stop!'
+                        estop = True
+                        break
+                print 'Train ', train_err, 'Valid ', valid_err, 'Test ', test_err
 
