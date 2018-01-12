@@ -139,7 +139,13 @@ def lstm_cond_layer(tparams,state_below,options,prefix,mask,context,one_step,ini
         temperature_c = theano.shared(np.float32(temperature),name='temperature_c')
         h_sampling_mask = trng.binomial((1,), p=semi_sampling_p, n=1, dtype=theano.config.floatX).sum()
 
-    #functions in theano.scan
+    #functions _step() in theano.scan
+    def _slice(_x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n * dim:(n + 1) * dim]
+        return _x[:, n * dim:(n + 1) * dim]
+
+
     def _step(m_, x_, h_, c_, a_, as_, ct_, pctx_):
         # prepare for calculating attention distribution
         pstate_ = tensor.dot(h_, tparams[_p(prefix,'Wd_att')])
@@ -155,30 +161,67 @@ def lstm_cond_layer(tparams,state_below,options,prefix,mask,context,one_step,ini
         alpha_sample = h_sampling_mask * trng.multinomial(pvals=alpha, dtype=theano.config.floatX) + (1. - h_sampling_mask) * alpha ## some kind of tricky thing
 
         # caculate the context used for caption generation
-        ctx_ = (context * alpha_sample[:,:,None]).sum(1) ##############################what exactly is it........
+        ctx_ = (context * alpha_sample[:,:,None]).sum(1) ##############################what exactly is it
 
         # IT IS REALLY ADD OR JUST CONCATENATE
         # I think it is 'concatenation of previous [hidden_state, input_word, context_vector] used for caculate next time activations of LSTM
+        # It is the equation in 3.1.2．　You can run it to see what is exactly going on here.
         preact = tensor.dot(h_,tparams(_p(prefix, 'U')))
         preact += x_
         preact += tensor.dot(ctx_,tparams(_p(prefix,'Wc')))
 
-        #compute next time activations of LSTM
+        # unpdate next time activations of LSTM.......................................................................................
+        i = _slice(preact,0,dim)
+        f = _slice(preact,1,dim)
+        o = _slice(preact,2,dim)
+        i = tensor.nnet.sigmoid(i)
+        f = tensor.nnet.sigmoid(f)
+        o = tensor.nnet.sigmoid(o)
+        c = tensor.tanh(_slice(preact,3,dim))
+        # new memory and hidden states
+        c = f * c + i * c
+        c = m_[:,None] * c + (1. - m_)[:,None] * c_ # what did mask do here........?????
 
-        
+        h = o * tensor.tanh(c)
+        h = m_[:,None] * h + (1. - m_)[:,None] * h_ # what did mask do here........?????
+
+        rval = [h, c, alpha, alpha_sample, ctx_]
+        rval += [pstate_, pctx_, i, f, o, preact, alpha_pre] + pctx_list
+        return rval
     # something used in theano.scan for building recurrent graph
     _step0 = lambda m_, x_, h_, c_, a_, as_, ct_, pctx_: _step(m_, x_, h_, c_, a_, as_, ct_, pctx_)
     seqs = [mask, state_below]#################################################
     outputs_info = [init_state,init_memory,tensor.alloc(0., n_samples, pctx_.shape[1]),
                         tensor.alloc(0., n_samples, pctx_.shape[1]),
                         tensor.alloc(0., n_samples, context.shape[2])]#####################################
-    rval, update = theano.scan(_step0,
+    proj, update = theano.scan(_step0,
                                sequences=seqs,
                                outputs_info=outputs_info,
                                non_sequences=[pctx_],
                                n_steps=state_below.shape[0])
     return rval, update
+    # GET information you need from the returend value of theano.scan...................................................................
+    attn_updates += updates#### I DON'T KNOW WHAT IT IS USED FOR
+    proj_h = proj[0]
+    alphas = proj[2]
+    alpha_sample = proj[3]
+    ctxs = proj[4]
 
+    # compute the word probability................................................................................................
+    logit = get_layer('ff')[1](tparams, proj_h, options, prefix='ff_logit_lstm', activ='linear')
+    logit = tanh(logit)
+    logit = get_layer('ff')[1](tparams, logit, options, prefix='ff_logit', activ='linear')
+    logit_shp = logit.shape
+    probs = tensor.nnet.softmax(logit.reshape([logit_shp[0] * logit_shp[1], logit_shp[2]]))
+    x_flat = x.flatten()
+    p_flat = probs.flatten()
+    cost = -tensor.log(p_flat[tensor.arange(x_flat.shape[0]) * probs.shape[1] + x_flat] + 1e-8)
+    cost = cost.reshape([x.shape[0], x.shape[1]])
+    masked_cost = cost * mask
+    cost = (masked_cost).sum(0)
+    opt_outs = dict()
+    opt_outs['masked_cost'] = masked_cost  # need this for reinforce later
+    opt_outs['attn_updates'] = attn_updates  # this is to update the rng
 
     pass
 
